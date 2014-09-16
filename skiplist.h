@@ -1,8 +1,4 @@
-//
 #include <stdlib.h>
-
-#define MAXLEVEL 32
-#define P 0.25
 
 typedef struct skiplistNode {
     void *obj;
@@ -37,17 +33,17 @@ skiplist *slCreate(int maxlevel);
 void slFree(skiplist *sl);
 void slDump(skiplist *sl);
 
-void slInsert(skiplist *sl, double score, void *obj);
-int slDelete(skiplist *sl, double score, void *obj);
+void slInsert(skiplist *sl, double score, void *obj, int level);
+int slDelete(skiplist *sl, double score, void *obj, double change);
 unsigned long slLength(skiplist *sl);
 unsigned long slDeleteByRank(skiplist *sl, unsigned int start, unsigned int end, slDeleteCb cb, void* ud);
 
 unsigned long slGetRank(skiplist *sl, double score, void *o);
-skiplistNode* slGetNodeByRank(skiplist *sl, unsigned long rank);
-
+skiplistNode* slGetNodeByRank(skiplistNode* x, int level, unsigned long rank);
 skiplistNode *slFirstInRange(skiplist *sl, double min, double max);
 skiplistNode *slLastInRange(skiplist *sl, double min, double max);
 
+skiplistiter *slIterNew(skiplist *sl, skiplistNode* head);
 skiplistiter* slIterNewFromHead(skiplist *sl);
 skiplistiter *slIterNewFromRange(skiplist *sl, double min, double max);
 void slIterDel(skiplistiter *it);

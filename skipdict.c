@@ -1,9 +1,12 @@
+#include <Python.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <Python.h>
 #include "skiplist.h"
+
+#define MAXLEVEL 32
+#define P 0.25
 
 #if PY_VERSION_HEX < 0x02050000 && !defined(PY_SSIZE_T_MIN)
 typedef int Py_ssize_t;
@@ -24,96 +27,91 @@ inline void PyString_Concat(PyObject** lhs, PyObject* rhs)
     Py_DECREF(lhs);
     *lhs = s;
 }
+#define PySliceObject PyObject
 #define PyInt_FromLong PyLong_FromLong
+#define PyInt_AsLong PyLong_AsLong
 #define PyString_FromString PyUnicode_FromString
+#define PyString_FromFormat PyUnicode_FromFormat
 #define PyString_FromStringAndSize PyUnicode_FromStringAndSize
 #define PyString_AsString PyUnicode_AsASCIIString
 #define _PyString_Join PyUnicode_Join
-#define MOD_ERROR_VAL NULL
-#define MOD_SUCCESS_VAL(val) val
-#define MOD_INIT(name) PyMODINIT_FUNC PyInit_##name(void)
-#define MOD_DEF(ob, name, doc, methods)                       \
-    static struct PyModuleDef moduledef = {                   \
-        PyModuleDef_HEAD_INIT, name, doc, -1, methods, };     \
-    ob = PyModule_Create(&moduledef);
+#define INITERROR return NULL
 #else
-#define MOD_ERROR_VAL
-#define MOD_SUCCESS_VAL(val)
-#define MOD_INIT(name) init##name(void)
-#define MOD_DEF(ob, name, doc, methods)             \
-    ob = Py_InitModule3(name, methods, doc);
+#define INITERROR return
 #endif
+
+#define double_AsString(value) \
+    PyOS_double_to_string(value, 'r', 0, Py_DTSF_ADD_DOT_0, 0);
 
 #define float_Convert(op, obj)                                  \
     if (obj == Py_None) obj = NULL;                             \
     if (obj) op = PyFloat_AsDouble(obj);                        \
     if (op == -1 && PyErr_Occurred()) {                         \
-    PyErr_Format(PyExc_TypeError,                               \
-                 "not a number: %s",                            \
-                 PyString_AsString(PyObject_Repr(obj)));        \
-    return NULL;                                                \
+        PyObject *repr = PyObject_Repr(obj);                    \
+        PyErr_Format(PyExc_TypeError,                           \
+                     "not a number: %s",                        \
+                     PyString_AsString(repr));                  \
+        Py_DECREF(repr);                                        \
+        return NULL;                                            \
     }
 
 #define PyType_Prepare(mod, name, type)                 \
     if (PyType_Ready(type) < 0) {                       \
-        return NULL;                                         \
+        INITERROR;                                      \
     }                                                   \
     Py_INCREF(type);                                    \
     PyModule_AddObject(mod, name, (PyObject *)type);
 
-#define skiplist_Check(op) PyObject_TypeCheck(op, &SkipDictType)
-#define skiplist_CheckExact(op) (Py_TYPE(op) == &SkipDictType)
+#define skipdict_Check(op) PyObject_TypeCheck(op, &SkipDictType)
+#define skipdict_CheckExact(op) (Py_TYPE(op) == &SkipDictType)
 
 static PyTypeObject SkipDictType;
-static PyTypeObject SkipDictItemIterType;
 static PyTypeObject SkipDictIterType;
-static PyTypeObject SkipDictIndexType;
+
+typedef enum {KEY, VALUE, ITEM} itertype;
 
 typedef struct {
     PyObject_HEAD
     skiplist *skiplist;
-    PyObject *compare;
     PyObject *random;
     PyObject *mapping;
-} SkipListObject;
+} SkipDictObject;
 
 typedef struct {
     PyObject_HEAD
-    SkipListObject *so;
+    SkipDictObject *skipdict;
     skiplistiter *iter;
-} SkipListIterObject;
+    itertype type;
+    unsigned long length;
+} SkipDictIterObject;
 
-typedef struct {
-    PyObject_HEAD
-    SkipListObject *so;
-} SkipListIndexObject;
+typedef PyObject * (*iterfunc)(double score, PyObject*);
 
-static void
-skiplistindex_dealloc(SkipListIndexObject *index)
-{
-    Py_XDECREF(index->so);
-    PyObject_GC_Del(index);
-}
+static PyObject * skipdictiter_next_key(double score, PyObject* value);
+static PyObject * skipdictiter_next_value(double score, PyObject* value);
+static PyObject * skipdictiter_next_item(double score, PyObject* value);
+
+static iterfunc iterators[3] = { skipdictiter_next_key,
+                                 skipdictiter_next_value,
+                                 skipdictiter_next_item };
+
+static const char* iterator_names[3] = { "keys", "values", "items" };
+static const char* booleans[2] = { "false", "true" };
 
 static PyObject *
-skiplistindex_call(SkipListIndexObject *self, PyObject *args)
+skipdict_index(SkipDictObject *self, PyObject *key)
 {
-    PyObject *key = NULL;
-    if (!PyArg_UnpackTuple(args, "call", 1, 1, &key)) {
-        return NULL;
-    }
-
-    PyObject* value = PyDict_GetItem(self->so->mapping, key);
-    if (!value) {
+    PyObject* item = PyDict_GetItem(self->mapping, key);
+    if (!item) {
         PyErr_SetObject(PyExc_KeyError,
                         PyObject_Repr(key));
         return NULL;
     }
+    PyObject* value = PyTuple_GET_ITEM(item, 1);
     double score = PyFloat_AsDouble(value);
     if (score == -1.0 && PyErr_Occurred()) return 0;
 
-    void *obj = (void*) key;
-    unsigned long rank = slGetRank(self->so->skiplist, score, obj);
+    unsigned long rank = slGetRank(self->skiplist, score, (void*) item);
     if (!rank) {
         return NULL;
     }
@@ -121,156 +119,187 @@ skiplistindex_call(SkipListIndexObject *self, PyObject *args)
     return PyLong_FromLong(rank - 1);
 }
 
-static PyObject *
-skiplistindex_item(SkipListIndexObject *self, Py_ssize_t index)
-{
-    unsigned long rank = index + 1;
-    skiplistNode* node = slGetNodeByRank(self->so->skiplist, rank);
-    if (!node) {
-        PyErr_SetObject(PyExc_IndexError,
-                        PyString_FromString("Index out of range"));
-        return NULL;
-    }
-
-    PyObject *obj = (PyObject*) node->obj;
-    Py_INCREF(obj);
-    return obj;
-}
-
 static int
-skiplistindex_traverse(SkipListIndexObject *index, visitproc visit,
-                       void *arg)
+skipdictiter_fetch(skiplistiter *iter, double *score, PyObject **obj)
 {
-    Py_VISIT(index->so);
-    return 0;
-}
-
-static int
-skiplistiter_fetch(SkipListIterObject *it,
-                   PyObject **key, PyObject **value)
-{
-    double score = 0;
-    const void *obj = NULL;
-    if (slIterGet(it->iter, &score, &obj)) {
+    PyObject* item;
+    if (slIterGet(iter, score, (void*) &item)) {
         PyErr_SetString(PyExc_StopIteration, "");
         return -1;
     }
-    if (slIterNext(it->iter)) {
+
+    if (slIterNext(iter)) {
         PyErr_SetString(PyExc_TypeError,
-                        "Unable to advance the internal iterator");
+                        "unable to advance the internal iterator");
         return -1;
     }
-    *key = (PyObject *) obj;
-    if (value) {
-        *value = (PyObject *) PyFloat_FromDouble(score);
-    }
+
+    *obj = PyTuple_GET_ITEM(item, 0);
     return 0;
 }
 
 static PyObject *
-skiplistiter_next(SkipListIterObject *it)
+skipdictiter_next(SkipDictIterObject *it)
 {
-    PyObject *key = NULL;
-    int err = skiplistiter_fetch(it, &key, NULL);
+    if (it->length == 0) {
+        PyErr_SetString(PyExc_StopIteration, "");
+        return NULL;
+    }
+
+    double score;
+    PyObject *key;
+
+    int err = skipdictiter_fetch(it->iter, &score, &key);
     if (err) {
         return NULL;
     }
+
+    it->length--;
+
+    return iterators[it->type](score, key);
+}
+
+static PyObject *
+skipdictiter_next_key(double score, PyObject* key)
+{
     Py_INCREF(key);
     return key;
 }
 
 static PyObject *
-skiplistiter_next_item(SkipListIterObject *it)
+skipdictiter_next_value(double score, PyObject* key)
 {
-    PyObject *key = NULL;
-    PyObject *value = NULL;
-    int err = skiplistiter_fetch(it, &key, &value);
-    if (err) {
-        return NULL;
-    }
-    Py_INCREF(key);
-    Py_INCREF(value);
-    return Py_BuildValue("(OO)", key, value);
+    return (PyObject *) PyFloat_FromDouble(score);
 }
 
 static PyObject *
-skiplistiter_next_value(SkipListIterObject *it)
+skipdictiter_next_item(double score, PyObject* key)
 {
-    PyObject *key = NULL;
-    PyObject *value = NULL;
-    int err = skiplistiter_fetch(it, &key, &value);
-    if (err) {
-        return NULL;
-    }
-    Py_INCREF(value);
-    return value;
+    Py_INCREF(key);
+    return Py_BuildValue("(OO)",
+                         key,
+                         (PyObject *) PyFloat_FromDouble(score));
 }
 
 static void
-skiplistiter_dealloc(SkipListIterObject *it)
+skipdictiter_dealloc(SkipDictIterObject *it)
 {
     PyObject_GC_UnTrack(it);
     slIterDel(it->iter);
-    Py_XDECREF(it->so);
+    Py_XDECREF(it->skipdict);
     PyObject_GC_Del(it);
 }
 
 static int
-skiplistiter_traverse(SkipListIterObject *it, visitproc visit, void *arg)
+skipdictiter_traverse(SkipDictIterObject *it, visitproc visit, void *arg)
 {
-    Py_VISIT(it->so);
+    Py_VISIT(it->skipdict);
     return 0;
 }
 
 static int
-skiplist_delitem(SkipListObject *self, PyObject *key, int delete)
+skipdict_delitem(SkipDictObject *self, PyObject *key, int delete)
 {
-    PyObject* old = PyDict_GetItem(self->mapping, key);
-    if (!old) goto Fail;
+    PyObject* item = PyDict_GetItem(self->mapping, key);
+    if (!item) goto Fail;
+    PyObject* value = PyTuple_GET_ITEM(item, 1);
     if (delete) PyDict_DelItem(self->mapping, key);
-    return (!slDelete(self->skiplist, PyFloat_AsDouble(old), key));
+    if (!slDelete(self->skiplist, PyFloat_AsDouble(value), (void*) item, 0)) {
+        goto Fail;
+    }
+    return 0;
  Fail:
-    PyErr_SetObject(PyExc_KeyError,
-                    PyObject_Repr(key));
+    PyErr_SetObject(PyExc_KeyError, key);
     return -1;
 }
 
 static int
-skiplist_insertobj(SkipListObject *self, PyObject *key, PyObject *value,
-                   int check)
+skipdict_insertobj(SkipDictObject *self, PyObject *key, PyObject *value,
+                   int mode)
 {
+    PyObject *item, *previous;
+    double score = PyFloat_AsDouble(value);
+    double s;
+    int level;
+
     if (!PyNumber_Check(value)) {
+        PyObject *repr = PyObject_Repr(value);
         PyErr_Format(PyExc_TypeError,
                      "not a number: %s",
-                     PyString_AsString(PyObject_Repr(value)));
+                     PyString_AsString(repr));
+        Py_DECREF(repr);
         return -1;
     }
-
-    double score = PyFloat_AsDouble(value);
 
     if (score == -1.0 && PyErr_Occurred()) {
         return -1;
     }
 
-    if (check) {
-        skiplist_delitem(self, key, 0);
-        PyErr_Clear();
+    if (mode > 0) {
+        if ((item = PyDict_GetItem(self->mapping, key))) {
+            previous = PyTuple_GET_ITEM(item, 1);
+            s = PyFloat_AsDouble(previous);
+
+            if (mode == 1) {
+                score -= s;
+            } else {
+                value = PyNumber_Add(value, previous);
+                if (!value) return -1;
+            }
+
+            switch (slDelete(self->skiplist, s, (void*) item, score)) {
+                case 0:
+                    return -1;
+                case 1:
+                    break;
+                case 2:
+                    PyTuple_SetItem(item, 1, value);
+                    Py_INCREF(value);
+                    return 0;
+            }
+
+            score += s;
+        }
     }
 
-    PyDict_SetItem(self->mapping, key, value);
-    Py_INCREF(key);
-    Py_INCREF(value);
+    item = PyTuple_Pack(2, key, value);
+    PyDict_SetItem(self->mapping, key, item);
+    Py_DECREF(item);
 
-    void *obj = (void*) key;
-    slInsert(self->skiplist, score, obj);
-
+    if (self->random) {
+        PyObject* result = PyObject_CallFunction(self->random, "i",
+                                                 self->skiplist->maxlevel);
+        level = (int) PyInt_AsLong(result);
+        if (level == -1 && PyErr_Occurred()) {
+            PyErr_Format(PyExc_TypeError,
+                         "not an integer: %s",
+                         PyString_AsString(PyObject_Repr(result)));
+            Py_XDECREF(result);
+            return -1;
+        }
+        Py_XDECREF(result);
+        if (level > self->skiplist->maxlevel) {
+            PyErr_Format(PyExc_ValueError,
+                         "level not in range (0-%d): %d",
+                         self->skiplist->maxlevel,
+                         level);
+            return -1;
+        }
+    } else {
+        level = 1;
+        while((random() & 0xffff) < (P * 0xffff))
+            level += 1;
+        level = (level < self->skiplist->maxlevel) \
+            ? level : self->skiplist->maxlevel;
+    }
+    slInsert(self->skiplist, score, (void*) item, level);
     return 0;
 }
 
 static int
-skiplist_insertseq(SkipListObject *self, PyObject *seq)
+skipdict_insertseq(SkipDictObject *self, PyObject *seq)
 {
-    PyObject *it;
+    PyObject *it = NULL;
     Py_ssize_t i;
     PyObject *item = NULL;
     PyObject *fast = NULL;
@@ -284,7 +313,7 @@ skiplist_insertseq(SkipListObject *self, PyObject *seq)
 
     if (seq != Py_None && !(PySequence_Check(seq) || PyIter_Check(seq))) {
         PyErr_SetString(PyExc_TypeError,
-                        "Expected dict, item sequence or iterable.");
+                        "expected dict, item sequence or iterable");
         goto Fail;
     }
 
@@ -326,7 +355,7 @@ skiplist_insertseq(SkipListObject *self, PyObject *seq)
         key = PySequence_Fast_GET_ITEM(fast, 0);
         value = PySequence_Fast_GET_ITEM(fast, 1);
 
-        if (skiplist_insertobj(self, key, value, 0)) {
+        if (skipdict_insertobj(self, key, value, 2)) {
             goto Fail;
         }
 
@@ -346,142 +375,140 @@ Return:
     return Py_SAFE_DOWNCAST(i, Py_ssize_t, int);
 }
 
+static PyObject *
+skipdict_change(SkipDictObject *self, PyObject *args)
+{
+    PyObject *key, *change;
+    if (!PyArg_ParseTuple(args, "OO:change", &key, &change)) {
+        return NULL;
+    }
+
+    if (skipdict_insertobj(self, key, change, 2)) return NULL;
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
 static int
-skiplist_setup(SkipListObject *self, int maxlevel,
-               PyObject *cmp, PyObject *rnd, PyObject *seq)
+skipdict_setup(SkipDictObject *self, int maxlevel,
+               PyObject *rnd, PyObject *seq)
 {
     int err = 0;
-    self->compare = cmp;
     self->random = rnd;
+    Py_XINCREF(rnd);
     self->mapping = NULL;
     self->skiplist = NULL;
-    Py_XINCREF(self->compare);
-    Py_XINCREF(self->random);
     self->skiplist = slCreate(maxlevel);
     if (!self->skiplist) {
-        err = -1;
-        goto Fail;
+        return -1;
     }
 
     self->mapping = PyDict_New();
 
     if (seq) {
-        err = skiplist_insertseq(self, seq);
+        err = skipdict_insertseq(self, seq);
         if (err) {
-            goto Fail;
+            return -1;
         }
     }
+
     return 0;
-Fail:
-    Py_XDECREF(self->compare);
-    Py_XDECREF(self->random);
-    Py_XDECREF(self->mapping);
-    return err;
 }
 
 static int
-skiplist_init(SkipListObject *self, PyObject *args, PyObject *kw)
+skipdict_init(SkipDictObject *self, PyObject *args, PyObject *kw)
 {
     int maxlevel = MAXLEVEL;
-    PyObject *cmp = NULL;
     PyObject *rnd = NULL;
     PyObject *seq = NULL;
     static char *kwlist[] = {
-        "sequence", "maxlevel", "compare", "random", NULL
+        "sequence", "maxlevel", "random", NULL
     };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "|OiOO:SkipList", kwlist,
-                                     &seq, &maxlevel, &cmp, &rnd)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|OiO:SkipDict", kwlist,
+                                     &seq, &maxlevel, &rnd)) {
         return -1;
     }
-    return skiplist_setup(self, maxlevel, cmp, rnd, seq);
+    return skipdict_setup(self, maxlevel, rnd, seq);
 }
 
 static void
-skiplist_dealloc(SkipListObject* self)
+skipdict_dealloc(SkipDictObject* self)
 {
     slFree(self->skiplist);
-    Py_XDECREF(self->compare);
+    if (self->mapping) {
+        PyDict_Clear(self->mapping);
+        Py_DECREF(self->mapping);
+    }
     Py_XDECREF(self->random);
-    Py_XDECREF(self->mapping);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
 static PyObject *
-skiplist_iterator(SkipListObject *self, skiplistiter *iter)
+skipdict_iterator(SkipDictObject *self, skiplistiter *iter, itertype type, Py_ssize_t length)
 {
-    SkipListIterObject *it = NULL;
-    if (!skiplist_Check(self)) {
+    SkipDictIterObject *it = NULL;
+    if (!skipdict_Check(self)) {
         PyErr_BadInternalCall();
         return NULL;
     }
-    it = PyObject_GC_New(SkipListIterObject, &SkipDictIterType);
-    if (!it) return NULL;
+
+    if (!iter) {
+        iter = slIterNewFromHead(self->skiplist);
+    }
+
+    if (!iter) {
+        return NULL;
+    }
+
+    it = PyObject_GC_New(SkipDictIterObject, &SkipDictIterType);
+    if (!it) {
+        slIterDel(iter);
+        return NULL;
+    }
+
     Py_INCREF(self);
-    it->so = self;
+
+    it->skipdict = self;
     it->iter = iter;
+    it->type = type;
+    it->length = length > 1 ? (unsigned long) length : slLength(self->skiplist);
     PyObject_GC_Track(it);
+
     return (PyObject *)it;
 }
 
 static PyObject *
-skiplist_iter(SkipListObject *so)
+skipdict_iter(SkipDictObject *skipdict)
 {
-    PyObject *it = NULL;
-    skiplistiter *iter = slIterNewFromHead(so->skiplist);
-    if (!iter) {
-        return NULL;
-    }
-    it = skiplist_iterator(so, iter);
-    if (!it) {
-        slIterDel(iter);
-    }
-    return it;
+    return skipdict_iterator(skipdict, NULL, KEY, -1);
 }
 
 static PyObject *
-skiplistindex_iter(SkipListIndexObject *self)
+skipdictiter_item(SkipDictIterObject *self, Py_ssize_t index)
 {
-    return skiplist_iter(self->so);
+    if (index < 0) {
+        index = self->length + index;
+    }
+
+    index = index % slLength(self->skipdict->skiplist);
+
+    skiplistNode* node = slGetNodeByRank(self->iter->node,
+                                         self->skipdict->skiplist->level - 1,
+                                         index);
+
+    if (!node) {
+        PyErr_SetObject(PyExc_IndexError,
+                        PyString_FromString("index out of range"));
+        return NULL;
+    }
+
+    PyObject *obj = PyTuple_GET_ITEM(node->obj, 0);
+    return iterators[self->type](node->score, obj);
 }
 
 static PyObject *
-skipdict_iterator(SkipListObject *self, skiplistiter *iter)
-{
-    SkipListIterObject *it = NULL;
-    if (!skiplist_Check(self)) {
-        PyErr_BadInternalCall();
-        return NULL;
-    }
-    it = PyObject_GC_New(SkipListIterObject, &SkipDictItemIterType);
-    if (it == NULL) {
-        return NULL;
-    }
-    Py_INCREF(self);
-    it->so = self;
-    it->iter = iter;
-    PyObject_GC_Track(it);
-    return (PyObject *)it;
-}
-
-static PyObject *
-skipdict_iter(SkipListObject *so)
-{
-    PyObject *it = NULL;
-    skiplistiter *iter = slIterNewFromHead(so->skiplist);
-    if (!iter) {
-        return NULL;
-    }
-    it = skipdict_iterator(so, iter);
-    if (!it) {
-        slIterDel(iter);
-    }
-    return it;
-}
-
-
-static PyObject *
-skiplistindex_slice(SkipListIndexObject *self, PyObject* item)
+skipdictiter_slice(SkipDictIterObject *self, PyObject* item)
 {
     if (PyIndex_Check(item)) {
         PyObject *i, *result;
@@ -489,8 +516,8 @@ skiplistindex_slice(SkipListIndexObject *self, PyObject* item)
         if (!i)
             return NULL;
         long index = PyLong_AsLong(i);
-        result = skiplistindex_item(self, index);
         Py_DECREF(i);
+        result = skipdictiter_item(self, index);
         return result;
     }
 
@@ -506,44 +533,129 @@ skiplistindex_slice(SkipListIndexObject *self, PyObject* item)
     Py_ssize_t step;
     Py_ssize_t length;
 
-    if (PySlice_GetIndicesEx(item, self->so->skiplist->length,
+    if (PySlice_GetIndicesEx((PySliceObject *)item,
+                             slLength(self->skipdict->skiplist),
                              &ilow, &ihigh, &step, &length)) {
         return NULL;
     }
 
-    skiplistNode* low = slGetNodeByRank(self->so->skiplist, ilow + 1);
-    if (!low) {
-        low = self->so->skiplist->header->level[0].forward;
+    if (step != 1) {
+        PyErr_Format(PyExc_ValueError,
+                     "slice step %d not supported",
+                     (int) step);
+        return NULL;
     }
 
-    skiplistNode* high = slGetNodeByRank(self->so->skiplist, ihigh);
-    if (!high) {
-        high = self->so->skiplist->tail;
-    }
 
-    skiplistiter *iter = slIterNewFromRange(self->so->skiplist,
-                                            low->score, high->score);
+    skiplistNode* node = slGetNodeByRank(self->iter->node,
+                                         self->skipdict->skiplist->level - 1,
+                                         ilow);
+
+    skiplistiter *iter = slIterNew(self->skipdict->skiplist, node);
 
     if (!iter) {
         return NULL;
     }
 
-    PyObject *it = skiplist_iterator(self->so, iter);
+    PyObject *it = skipdict_iterator(self->skipdict, iter, self->type, ihigh - ilow);
     if (!it) {
         slIterDel(iter);
     }
+
     return it;
 }
 
+static Py_ssize_t
+skipdict_length(SkipDictObject *self)
+{
+    Py_ssize_t len = slLength(self->skiplist);
+    return len;
+}
+
+static int
+skipdict_contains(SkipDictObject *self, PyObject *key)
+{
+    return PyDict_Contains(self->mapping, key);
+}
+
 static PyObject *
-skipdict_iteritems(SkipListObject *self, PyObject *args, PyObject *kw)
+skipdict_getitem(SkipDictObject *self, PyObject *key)
+{
+    PyObject *item = PyDict_GetItem(self->mapping, key);
+    if (!item) {
+        PyErr_SetObject(PyExc_KeyError, key);
+        return NULL;
+    }
+    PyObject* value = PyTuple_GET_ITEM(item, 1);
+    Py_INCREF(value);
+    return value;
+}
+
+static int
+skipdict_ass_sub(SkipDictObject *self, PyObject *key, PyObject *value)
+{
+    if (value) {
+        if (skipdict_insertobj(self, key, value, 1)) return -1;
+    } else {
+        if (skipdict_delitem(self, key, 1)) return -1;
+    }
+    return 0;
+}
+
+static PyObject *
+skipdict_get(SkipDictObject *self, PyObject *args)
+{
+    PyObject *key, *value;
+    PyObject *failobj = Py_None;
+
+    if (!PyArg_UnpackTuple(args, "get", 1, 2, &key, &failobj))
+        return NULL;
+
+    PyObject *item = PyDict_GetItem(self->mapping, key);
+    if (item) {
+        value = PyTuple_GET_ITEM(item, 1);
+    } else {
+        value = failobj;
+    }
+
+    Py_INCREF(value);
+    return value;
+}
+
+PyObject *
+skipdict_setdefault(SkipDictObject *self, PyObject *args)
+{
+    PyObject *key, *value;
+    PyObject *defaultobj = Py_None;
+
+    if (!PyArg_UnpackTuple(args, "setdefault", 1, 2, &key, &defaultobj))
+        return NULL;
+
+    PyObject *item = PyDict_GetItem(self->mapping, key);
+    if (!item) {
+        if (skipdict_insertobj(self, key, defaultobj, 0)) {
+            return NULL;
+        }
+        value = defaultobj;
+    } else {
+        value = PyTuple_GET_ITEM(item, 1);
+    }
+
+    Py_XINCREF(value);
+    return value;
+}
+
+static PyObject *
+skipdict_iterator_from_range(SkipDictObject *self,
+                             PyObject *args, PyObject *kw,
+                             itertype type)
 {
     PyObject *min = NULL;
     PyObject *max = NULL;
 
     static char *kwlist[] = {"min", "max", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "|OO:SkipList", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|OO:SkipDict", kwlist,
                                      &min, &max)) {
         return NULL;
     }
@@ -571,7 +683,7 @@ skipdict_iteritems(SkipListObject *self, PyObject *args, PyObject *kw)
     if (!iter) {
         return NULL;
     }
-    it = skipdict_iterator(self, iter);
+    it = skipdict_iterator(self, iter, type, -1);
     if (!it) {
         slIterDel(iter);
     }
@@ -579,19 +691,39 @@ skipdict_iteritems(SkipListObject *self, PyObject *args, PyObject *kw)
 }
 
 static PyObject *
-skiplist_repr(SkipListObject *self)
+skipdict_keys(SkipDictObject *self, PyObject *args, PyObject *kw)
+{
+    return skipdict_iterator_from_range(self, args, kw, KEY);
+}
+
+static PyObject *
+skipdict_values(SkipDictObject *self, PyObject *args, PyObject *kw)
+{
+    return skipdict_iterator_from_range(self, args, kw, VALUE);
+}
+
+static PyObject *
+skipdict_items(SkipDictObject *self, PyObject *args, PyObject *kw)
+{
+    return skipdict_iterator_from_range(self, args, kw, ITEM);
+}
+
+static PyObject *
+skipdict_repr(SkipDictObject *self)
 {
     Py_ssize_t i;
     PyObject *s, *temp, *colon = NULL;
     PyObject *pieces = NULL, *result = NULL;
     PyObject *key, *value;
+    SkipDictIterObject * it = NULL;
+    double score;
 
     i = Py_ReprEnter((PyObject *)self);
     if (i != 0) {
         return i > 0 ? PyString_FromString("{...}") : NULL;
     }
 
-    if (self->skiplist->length == 0) {
+    if (slLength(self->skiplist) == 0) {
         result = PyString_FromString("{}");
         goto Done;
     }
@@ -604,15 +736,14 @@ skiplist_repr(SkipListObject *self)
     if (colon == NULL)
         goto Done;
 
-    SkipListIterObject *iter = (SkipListIterObject* ) skipdict_iter(self);
+    it = (SkipDictIterObject* ) skipdict_iterator(self, NULL, ITEM, -1);
 
     /* Do repr() on each key+value pair, and insert ": " between them.
        Note that repr may mutate the dict. */
     i = 0;
-    while (!skiplistiter_fetch(iter, &key, &value)) {
+    while (!skipdictiter_fetch(it->iter, &score, &key)) {
+        value = (PyObject *) PyFloat_FromDouble(score);
         int status;
-        /* Prevent repr from deleting value during key format. */
-        Py_INCREF(value);
         s = PyObject_Repr(key);
         PyString_Concat(&s, colon);
         PyString_ConcatAndDel(&s, PyObject_Repr(value));
@@ -632,6 +763,7 @@ skiplist_repr(SkipListObject *self)
     s = PyString_FromString("{");
     if (s == NULL)
         goto Done;
+
     temp = PyList_GET_ITEM(pieces, 0);
     PyString_ConcatAndDel(&s, temp);
     PyList_SET_ITEM(pieces, 0, s);
@@ -656,246 +788,90 @@ skiplist_repr(SkipListObject *self)
 Done:
     Py_XDECREF(pieces);
     Py_XDECREF(colon);
+    Py_XDECREF(it);
     Py_ReprLeave((PyObject *)self);
     return result;
 }
 
-static Py_ssize_t
-skiplist_length(SkipListObject *self)
-{
-    Py_ssize_t len = slLength(self->skiplist);
-    return len;
-}
-
-static Py_ssize_t
-skiplistindex_length(SkipListIndexObject *self)
-{
-    return skiplist_length(self->so);
-}
-
-static int
-skiplist_contains(SkipListObject *self, PyObject *key)
-{
-    return PyDict_Contains(self->mapping, key);
-}
-
 static PyObject *
-skiplist_index(SkipListObject *self)
-{
-    SkipListIndexObject *index;
-
-    if (!skiplist_Check(self)) {
-        PyErr_Format(PyExc_TypeError,
-                     "%s() requires a skipdict argument, not '%s'",
-                     SkipDictIndexType.tp_name, Py_TYPE(self)->tp_name);
-        return NULL;
-    }
-
-    index = PyObject_GC_New(SkipListIndexObject, &SkipDictIndexType);
-    if (!index) return NULL;
-    Py_INCREF(self);
-    index->so = self;
-    PyObject_GC_Track(index);
-    return (PyObject *)index;
-}
-
-static PyObject *
-skiplist_getitem(SkipListObject *self, PyObject *key)
-{
-    PyObject *obj = PyDict_GetItem(self->mapping, key);
-    if (!obj) {
-        PyErr_SetObject(PyExc_KeyError,
-                        PyObject_Repr(key));
-        return NULL;
-    }
-
-    Py_INCREF(obj);
-    return obj;
-}
-
-static int
-skiplist_ass_sub(SkipListObject *self, PyObject *key, PyObject *value)
-{
-    if (value) {
-        if (skiplist_insertobj(self, key, value, 1)) return -1;
-    } else {
-        if (skiplist_delitem(self, key, 1)) return -1;
-    }
-    return 0;
-}
-
-static PyObject *
-skiplistiter_tolist(SkipListIterObject* it,
-                    PyObject* (*next)(SkipListIterObject*))
-{
-    register PyObject *v;
-
-    PyObject *item;
-
-    v = PyList_New(0);
-    if (v == NULL)
-        return NULL;
-
-    for (;;) {
-        item = next(it);
-
-        if (!item) {
-            if (PyErr_Occurred()) {
-                if (PyErr_ExceptionMatches(PyExc_StopIteration)) {
-                    PyErr_Clear();
-                } else {
-                    v = NULL;
-                }
-                goto Return;
-            }
-            break;
-        }
-
-        Py_INCREF(item);
-        PyList_Append(v, item);
-    }
-Return:
-    Py_DECREF(it);
-    return v;
-}
-
-static PyObject *
-skiplistiter_items(SkipListIterObject *self)
-{
-    return skiplistiter_tolist(self, &skiplistiter_next_item);
-}
-
-static PyObject *
-skiplistiter_values(SkipListIterObject *self)
-{
-    return skiplistiter_tolist(self, &skiplistiter_next_value);
-}
-
-static PyObject *
-skiplist_get(SkipListObject *self, PyObject *args)
-{
-    PyObject *key;
-    PyObject *failobj = Py_None;
-
-    if (!PyArg_UnpackTuple(args, "get", 1, 2, &key, &failobj))
-        return NULL;
-
-    PyObject *value = PyDict_GetItem(self->mapping, key);
-    if (!value) {
-        value = failobj;
-    }
-
-    Py_INCREF(value);
-    return value;
-}
-
-PyObject *
-skiplist_setdefault(SkipListObject *self, PyObject *args)
-{
-    PyObject *key;
-    PyObject *defaultobj = Py_None;
-
-    if (!PyArg_UnpackTuple(args, "setdefault", 1, 2, &key, &defaultobj))
-        return NULL;
-
-    PyObject *value = PyDict_GetItem(self->mapping, key);
-    if (!value) {
-        if (skiplist_insertobj(self, key, defaultobj, 0)) {
-            return NULL;
-        }
-        value = defaultobj;
-    }
-
-    Py_XINCREF(value);
-    return value;
-}
-
-
-static PyObject *
-skiplist_keys(SkipListObject *self)
-{
-    SkipListIterObject* iter = (SkipListIterObject*) skiplist_iter(self);
-    return skiplistiter_tolist(iter, &skiplistiter_next);
-}
-
-static PyObject *
-skiplist_values(SkipListObject *self)
-{
-    SkipListIterObject* iter = (SkipListIterObject*) skiplist_iter(self);
-    return skiplistiter_tolist(iter, &skiplistiter_next_value);
-}
-
-static PyObject *
-skiplist_items(SkipListObject *self)
-{
-    SkipListIterObject* iter = (SkipListIterObject*) skiplist_iter(self);
-    return skiplistiter_tolist(iter, &skiplistiter_next_item);
-}
-
-static PyObject *
-skiplist_maxlevel(SkipListObject *self)
+skipdict_maxlevel(SkipDictObject *self)
 {
     return PyInt_FromLong(self->skiplist->maxlevel);
 }
 
 static PyObject *
-skiplistindex_repr(SkipListIndexObject *self)
+skipdictiter_repr(SkipDictIterObject *self)
 {
-    PyObject *keys = skiplist_keys(self->so);
-    PyObject *repr = PyObject_Repr(keys);
-    Py_DECREF(keys);
+    char* min = double_AsString(self->iter->min);
+    char* max = double_AsString(self->iter->max);
+    PyObject *repr = PyString_FromFormat("<SkipDictIterator "
+                                         "type=\"%s\" "
+                                         "forward=%s "
+                                         "min=%s "
+                                         "max=%s "
+                                         "at %p>",
+                                         iterator_names[self->type],
+                                         booleans[self->iter->forward],
+                                         min,
+                                         max,
+                                         self->skipdict);
+    PyMem_Free(min);
+    PyMem_Free(max);
     return repr;
 }
 
 static PyObject *
-skiplist_richcompare(SkipListObject *self, PyObject* other, int op)
+skipdict_richcompare(SkipDictObject *self, PyObject* other, int op)
 {
     PyObject *mapping;
     if (PyDict_Check(other)) {
         mapping = other;
     } else {
-        if (!skiplist_Check(other)) {
+        if (!skipdict_Check(other)) {
+            PyObject *repr = PyObject_Repr(other);
             PyErr_Format(PyExc_TypeError,
                          "can't compare with %s",
-                         PyString_AsString(PyObject_Repr(other)));
+                         PyString_AsString(repr));
+            Py_DECREF(repr);
+            return NULL;
         }
-        SkipListObject* obj = (SkipListObject*) other;
+        SkipDictObject* obj = (SkipDictObject*) other;
         mapping = obj->mapping;
     }
     return PyDict_Type.tp_richcompare(self->mapping, mapping, op);
 }
 
-static PyMethodDef skiplist_methods[] = {
-    {"get", (PyCFunction)skiplist_get, METH_VARARGS, NULL},
-    {"setdefault", (PyCFunction)skiplist_setdefault, METH_VARARGS, NULL},
-    {"keys", (PyCFunction)skiplist_keys,  METH_NOARGS, NULL},
-    {"items", (PyCFunction)skiplist_items,  METH_NOARGS, NULL},
-    {"values", (PyCFunction)skiplist_values,  METH_NOARGS, NULL},
-    {"iteritems", (PyCFunction)skipdict_iteritems,  METH_VARARGS | METH_KEYWORDS, NULL},
+static PyMethodDef skipdict_methods[] = {
+    {"get", (PyCFunction)skipdict_get, METH_VARARGS, NULL},
+    {"setdefault", (PyCFunction)skipdict_setdefault, METH_VARARGS, NULL},
+    {"keys", (PyCFunction)skipdict_keys, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"values", (PyCFunction)skipdict_values, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"items", (PyCFunction)skipdict_items, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"index", (PyCFunction)skipdict_index, METH_O, NULL},
+    {"change", (PyCFunction)skipdict_change, METH_VARARGS, NULL},
     {NULL}
 };
 
-static PyGetSetDef skiplist_getset[] = {
-    {"maxlevel", (getter)skiplist_maxlevel, NULL, "maximum level", NULL},
-    {"index", (getter)skiplist_index, NULL, "index", NULL},
+static PyGetSetDef skipdict_getset[] = {
+    {"maxlevel", (getter)skipdict_maxlevel, NULL, "maxlevel", NULL},
     {NULL}
 };
 
 static PyMappingMethods mapping = {
-    (lenfunc)skiplist_length,              /*mp_length*/
-    (binaryfunc)skiplist_getitem,          /*mp_subscript*/
-    (objobjargproc)skiplist_ass_sub,       /*mp_ass_subscript*/
+    (lenfunc)skipdict_length,              /*mp_length*/
+    (binaryfunc)skipdict_getitem,          /*mp_subscript*/
+    (objobjargproc)skipdict_ass_sub,       /*mp_ass_subscript*/
 };
 
 static PySequenceMethods sequence = {
-    (lenfunc)skiplist_length,              /*sq_length*/
+    (lenfunc)skipdict_length,              /*sq_length*/
     0,                                     /*sq_concat*/
     0,                                     /*sq_repeat*/
     0,                                     /*sq_item*/
  	0,                                     /*sq_slice*/
     0,                                     /*sq_ass_item*/
     0,                                     /*sq_ass_slice*/
-    (objobjproc)skiplist_contains,         /*sq_contains*/
+    (objobjproc)skipdict_contains,         /*sq_contains*/
     0,                                     /*sq_inplace_concat*/
     0,                                     /*sq_inplace_repeat*/
 };
@@ -903,14 +879,14 @@ static PySequenceMethods sequence = {
 static PyTypeObject SkipDictType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     "skipdict.SkipDict",                   /* tp_name */
-    sizeof(SkipListObject),                /* tp_basicsize */
+    sizeof(SkipDictObject),                /* tp_basicsize */
     0,                                     /* tp_itemsize */
-    (destructor)skiplist_dealloc,          /* tp_dealloc */
+    (destructor)skipdict_dealloc,          /* tp_dealloc */
     0,                                     /* tp_print */
     0,                                     /* tp_getattr */
     0,                                     /* tp_setattr */
     0,                                     /* tp_compare */
-    (reprfunc)skiplist_repr,               /* tp_repr */
+    (reprfunc)skipdict_repr,               /* tp_repr */
     0,                                     /* tp_as_number */
     &sequence,                             /* tp_as_sequence*/
     &mapping,                              /* tp_as_mapping */
@@ -924,46 +900,46 @@ static PyTypeObject SkipDictType = {
     0,                                     /* tp_doc */
     0,		                               /* tp_traverse */
     0,		                               /* tp_clear */
-    (richcmpfunc)skiplist_richcompare,     /* tp_richcompare */
+    (richcmpfunc)skipdict_richcompare,     /* tp_richcompare */
     0,		                               /* tp_weaklistoffset */
-    (getiterfunc)skiplist_iter,            /* tp_iter */
+    (getiterfunc)skipdict_iter,            /* tp_iter */
     0,		                               /* tp_iternext */
-    skiplist_methods,                      /* tp_methods */
+    skipdict_methods,                      /* tp_methods */
     0,                                     /* tp_members */
-    skiplist_getset,                       /* tp_getset */
+    skipdict_getset,                       /* tp_getset */
     0,                                     /* tp_base */
     0,                                     /* tp_dict */
     0,                                     /* tp_descr_get */
     0,                                     /* tp_descr_set */
     0,                                     /* tp_dictoffset */
-    (initproc)skiplist_init,               /* tp_init */
+    (initproc)skipdict_init,               /* tp_init */
     PyType_GenericAlloc,                   /* tp_alloc */
     PyType_GenericNew,                     /* tp_new */
     PyObject_Del,                          /* tp_free */
     0,                                     /* tp_is_gc */
 };
 
-static PyMethodDef skiplistiter_methods[] = {
-    {"items", (PyCFunction)skiplistiter_items,  METH_NOARGS, NULL},
-    {"values", (PyCFunction)skiplistiter_values,  METH_NOARGS, NULL},
-    {NULL}
+static PyMappingMethods skipdictiter_as_mapping = {
+    0,                                     /*mp_length*/
+    (binaryfunc)skipdictiter_slice,        /*mp_subscript*/
+    0,                                     /*mp_ass_subscript*/
 };
 
 static PyTypeObject SkipDictIterType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     "skipdict.SkipDictIterator",            /* tp_name */
-    sizeof(SkipListIterObject),             /* tp_basicsize */
+    sizeof(SkipDictIterObject),             /* tp_basicsize */
     0,                                      /* tp_itemsize */
     /* methods */
-    (destructor)skiplistiter_dealloc,       /* tp_dealloc */
+    (destructor)skipdictiter_dealloc,       /* tp_dealloc */
     0,                                      /* tp_print */
     0,                                      /* tp_getattr */
     0,                                      /* tp_setattr */
     0,                                      /* tp_compare */
-    0,                                      /* tp_repr */
+    (reprfunc)skipdictiter_repr,            /* tp_repr */
     0,                                      /* tp_as_number */
     0,                                      /* tp_as_sequence */
-    0,                                      /* tp_as_mapping */
+    &skipdictiter_as_mapping,               /* tp_as_mapping */
     0,                                      /* tp_hash */
     0,                                      /* tp_call */
     0,                                      /* tp_str */
@@ -972,118 +948,53 @@ static PyTypeObject SkipDictIterType = {
     0,                                      /* tp_as_buffer */
     Py_TPFLAGS_DEFAULT|Py_TPFLAGS_HAVE_GC,  /* tp_flags */
     0,                                      /* tp_doc */
-    (traverseproc)skiplistiter_traverse,    /* tp_traverse */
+    (traverseproc)skipdictiter_traverse,    /* tp_traverse */
     0,                                      /* tp_clear */
     0,                                      /* tp_richcompare */
     0,                                      /* tp_weaklistoffset */
     PyObject_SelfIter,                      /* tp_iter */
-    (iternextfunc)skiplistiter_next,        /* tp_iternext */
-    skiplistiter_methods,                   /* tp_methods */
-};
-
-static PyTypeObject SkipDictItemIterType = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    "skipdict.SkipDictItemIterator",        /* tp_name */
-    sizeof(SkipListIterObject),             /* tp_basicsize */
-    0,                                      /* tp_itemsize */
-    /* methods */
-    (destructor)skiplistiter_dealloc,       /* tp_dealloc */
-    0,                                      /* tp_print */
-    0,                                      /* tp_getattr */
-    0,                                      /* tp_setattr */
-    0,                                      /* tp_compare */
-    0,                                      /* tp_repr */
-    0,                                      /* tp_as_number */
-    0,                                      /* tp_as_sequence */
-    0,                                      /* tp_as_mapping */
-    0,                                      /* tp_hash */
-    0,                                      /* tp_call */
-    0,                                      /* tp_str */
-    PyObject_GenericGetAttr,                /* tp_getattro */
-    0,                                      /* tp_setattro */
-    0,                                      /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_HAVE_GC,  /* tp_flags */
-    0,                                      /* tp_doc */
-    (traverseproc)skiplistiter_traverse,    /* tp_traverse */
-    0,                                      /* tp_clear */
-    0,                                      /* tp_richcompare */
-    0,                                      /* tp_weaklistoffset */
-    PyObject_SelfIter,                      /* tp_iter */
-    (iternextfunc)skiplistiter_next_item,   /* tp_iternext */
-};
-
-static PySequenceMethods skiplistindex_as_sequence = {
-    (lenfunc)skiplistindex_length,          /* sq_length*/
-    0,                                      /* sq_concat*/
-    0,                                      /* sq_repeat*/
-    (ssizeargfunc)skiplistindex_item,       /* sq_item */
-    0,                                      /* sq_slice */
-    0,                                      /* sq_ass_item*/
-    0,                                      /* sq_ass_slice*/
-    0,                                      /* sq_contains*/
-    0,                                      /* sq_inplace_concat*/
-    0,                                      /* sq_inplace_repeat*/
-};
-
-static PyMappingMethods skiplistindex_as_mapping = {
-    (lenfunc)skiplistindex_length,          /* mp_length */
-    (binaryfunc)skiplistindex_slice,        /* mp_subscript */
-    (objobjargproc)0,                       /* mp_ass_subscript */
-};
-
-static PyTypeObject SkipDictIndexType = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    "skipdict.SkipDictIndex",                   /* tp_name */
-    sizeof(SkipListIndexObject),                /* tp_basicsize */
-    0,                                          /* tp_itemsize */
-    /* methods */
-    (destructor)skiplistindex_dealloc,          /* tp_dealloc */
-    0,                                          /* tp_print */
-    0,                                          /* tp_getattr */
-    0,                                          /* tp_setattr */
-    0,                                          /* tp_reserved */
-    (reprfunc)skiplistindex_repr,               /* tp_repr */
-    0,                                          /* tp_as_number */
-    &skiplistindex_as_sequence,                 /* tp_as_sequence */
-    &skiplistindex_as_mapping,                  /* tp_as_mapping */
-    0,                                          /* tp_hash */
-    (ternaryfunc)skiplistindex_call,            /* tp_call */
-    0,                                          /* tp_str */
-    PyObject_GenericGetAttr,                    /* tp_getattro */
-    0,                                          /* tp_setattro */
-    0,                                          /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,    /* tp_flags */
-    0,                                          /* tp_doc */
-    (traverseproc)skiplistindex_traverse,       /* tp_traverse */
-    0,                                          /* tp_clear */
-    0,                                          /* tp_richcompare */
-    0,                                          /* tp_weaklistoffset */
-    (getiterfunc)skiplistindex_iter,            /* tp_iter */
-    0,                                          /* tp_iternext */
-    0,                                          /* tp_methods */
-    0,
+    (iternextfunc)skipdictiter_next,        /* tp_iternext */
+    0,                                      /* tp_methods */
 };
 
 static PyMethodDef methods[] = {
     {NULL, NULL, 0, NULL}
 };
 
-static char doc[] = "A probabilistic data structure which provides lookups in logarithmic time.";
+#if PY_MAJOR_VERSION >= 3
+static struct PyModuleDef moduledef = {
+        PyModuleDef_HEAD_INIT,
+        "skipdict",
+        NULL,
+        0,
+        methods,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+};
 
-MOD_INIT(skipdict) {
-    PyObject* mod;
+PyObject *
+PyInit_skipdict(void)
+#else
+void
+initskipdict(void)
+#endif
+{
+#if PY_MAJOR_VERSION >= 3
+    PyObject *module = PyModule_Create(&moduledef);
+#else
+    PyObject *module = Py_InitModule("skipdict", methods);
+#endif
 
-    MOD_DEF(mod, "skipdict", doc, methods)
+    if (module == NULL)
+        INITERROR;
 
-    if (mod == NULL)
-        return MOD_ERROR_VAL;
+    PyType_Prepare(module, "SkipDict", &SkipDictType);
+    PyType_Prepare(module, "SkipDictIterator", &SkipDictIterType);
 
-    PyType_Prepare(mod, "SkipDict", &SkipDictType);
-    PyType_Prepare(mod, "SkipDictIterator", &SkipDictIterType);
-    PyType_Prepare(mod, "SkipDictItemIterator", &SkipDictItemIterType);
-    PyType_Prepare(mod, "SkipDictIndex", &SkipDictIndexType);
-
-    return MOD_SUCCESS_VAL(mod);
+#if PY_MAJOR_VERSION >= 3
+    return module;
+#endif
 }
-
 /* EOF */

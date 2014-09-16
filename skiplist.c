@@ -2,15 +2,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
 #include "skiplist.h"
 
 #define SWAP(x, y, T) do { T temp##x##y = x; x = y; y = temp##x##y; } while (0)
 
 skiplistNode *slCreateNode(int level, double score, void *obj) {
-    skiplistNode *n = malloc(sizeof(*n) + level * sizeof(struct skiplistLevel));
+    skiplistNode *n = calloc(1, sizeof(*n) + level * sizeof(struct skiplistLevel));
     n->score = score;
-    n->obj   = obj;
+    n->obj = obj;
     return n;
 }
 
@@ -44,17 +43,10 @@ void slFree(skiplist *sl) {
     free(sl);
 }
 
-int slRandomLevel(int maxlevel) {
-    int level = 1;
-    while((random() & 0xffff) < (P * 0xffff))
-        level += 1;
-    return (level < maxlevel) ? level : maxlevel;
-}
-
-void slInsert(skiplist *sl, double score, void *obj) {
+void slInsert(skiplist *sl, double score, void *obj, int level) {
     skiplistNode *update[sl->maxlevel], *x;
     unsigned int rank[sl->maxlevel];
-    int i, level;
+    int i;
 
     x = sl->header;
     for (i = sl->level-1; i >= 0; i--) {
@@ -70,10 +62,9 @@ void slInsert(skiplist *sl, double score, void *obj) {
         update[i] = x;
     }
     /* we assume the key is not already inside, since we allow duplicated
-     * scores, and the re-insertion of score and redis object should never
+     * scores, and the re-insertion of score and object should never
      * happen since the caller of slInsert() should test in the hash table
      * if the element is already inside or not. */
-    level = slRandomLevel(sl->maxlevel);
     if (level > sl->level) {
         for (i = sl->level; i < level; i++) {
             rank[i] = 0;
@@ -128,8 +119,8 @@ void slDeleteNode(skiplist *sl, skiplistNode *x, skiplistNode **update) {
 }
 
 /* Delete an element with matching score/object from the skiplist. */
-int slDelete(skiplist *sl, double score, void *obj) {
-    skiplistNode *update[sl->maxlevel], *x;
+int slDelete(skiplist *sl, double score, void *obj, double change) {
+    skiplistNode *update[sl->maxlevel], *x, *y;
     int i;
 
     x = sl->header;
@@ -145,6 +136,13 @@ int slDelete(skiplist *sl, double score, void *obj) {
      * is to find the element with both the right score and object. */
     x = x->level[0].forward;
     if (x && score == x->score && x->obj == obj) {
+        if (change > 0) {
+            y = x->level[0].forward;
+            if (y && score + change < y->score) {
+                x->score = score + change;
+                return 2;
+            }
+        }
         slDeleteNode(sl, x, update);
         free(x);
         return 1;
@@ -212,24 +210,19 @@ unsigned long slGetRank(skiplist *sl, double score, void *obj) {
 }
 
 /* Finds an element by its rank. The rank argument needs to be 1-based. */
-skiplistNode* slGetNodeByRank(skiplist *sl, unsigned long rank) {
-    if(rank == 0 || rank > sl->length) {
-        return NULL;
-    }
-
-    skiplistNode *x;
+skiplistNode* slGetNodeByRank(skiplistNode* node, int level, unsigned long rank)
+{
     unsigned long traversed = 0;
     int i;
 
-    x = sl->header;
-    for (i = sl->level-1; i >= 0; i--) {
-        while (x->level[i].forward && (traversed + x->level[i].span) <= rank)
+    for (i = level; i >= 0; i--) {
+        while (node->level[i].forward && (traversed + node->level[i].span) <= rank)
         {
-            traversed += x->level[i].span;
-            x = x->level[i].forward;
+            traversed += node->level[i].span;
+            node = node->level[i].forward;
         }
         if (traversed == rank) {
-            return x;
+            return node;
         }
     }
 
@@ -302,17 +295,22 @@ unsigned long slLength(skiplist *sl)
     return sl->length;
 }
 
-skiplistiter *slIterNewFromHead(skiplist *sl)
+skiplistiter *slIterNew(skiplist *sl, skiplistNode* head)
 {
     skiplistiter *it = calloc(1, sizeof(struct skiplistiter));
     if (it) {
         it->parent = sl;
-        it->node = sl->header->level[0].forward;
+        it->node = head;
         it->forward = 1;
         it->min = it->node->score;
         it->max = sl->tail->score;
     }
     return it;
+}
+
+skiplistiter *slIterNewFromHead(skiplist *sl)
+{
+    return slIterNew(sl, sl->header->level[0].forward);
 }
 
 skiplistiter *slIterNewFromRange(skiplist *sl, double min, double max)

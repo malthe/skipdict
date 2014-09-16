@@ -3,41 +3,88 @@ SkipDict
 
 A skip dict is a Python dictionary which is permanently sorted by
 value. This package provides a fast, idiomatic implementation written
-in C – based on Redis' sorted sets.
+in C with an extensive test suite.
 
 The data structure uses a `skip list
 <http://en.wikipedia.org/wiki/Skip_list>`_ internally.
 
-An example use is a leaderboard where the skip dict provides very fast access to the score of each user, the position and the current top users.
+An example use is a leaderboard where the skip dict provides
+logarithmic access to the score and ranking of each user, as well as
+efficient iteration in either direction from any node.
+
+Compatible with Python 2.7+ and Python 3.3+.
 
 
 Usage
 -----
 
-The skip dict works just like a normal dictionary except its values
-must be numbers::
+The skip dict works just like a normal dictionary except it maps only
+to floating point values::
 
   from skipdict import SkipDict
 
-  skipdict = SkipDict()
+  skipdict = SkipDict(maxlevel=4)
+
   skipdict['foo'] = 1.0
   skipdict['bar'] = 2.0
 
-The ``skipdict`` is sorted by value which means that iteration and standard mapping protocol methods such as ``keys()``, ``values()`` and ``items()`` return items in sorted order.
+The ``SkipDict`` optionally takes a dictionary or a sequence of
+``(key, value)`` pairs::
 
-Each of these methods have been extended with optional range arguments ``min`` and ``max`` which filter based on value:
+  skipdict = SkipDict({'foo': 1.0, 'bar': 2.0})
+  skipdict = SkipDict(('foo', 1.0), ('bar', 1.0), ('bar', 1.0))
 
->>> skipdict.keys(min=2.0)
+Note that duplicates are automatically aggregated to a sum. To
+illustrate this, we can count the occurrences of letters in a text::
+
+  skipdict = SkipDict(
+      (char, 1) for char in
+      "Everything popular is wrong. - Oscar Wilde"
+  )
+
+  # The most frequent letter is a space.
+  skipdict.keys()[-1] == " "
+
+The ``skipdict`` is sorted by value which means that iteration and
+standard mapping protocol methods such as ``keys()``, ``values()`` and
+``items()`` return items in sorted order.
+
+Each of these methods have been extended with optional range arguments
+``min`` and ``max`` which limit iteration based on value. In addition,
+the iterator objects support the item and slice protocols:
+
+>>> skipdict.keys(min=2.0)[0]
+'bar'
+>>> skipdict.keys(max=2.0)[1:]
 ['bar']
 
-In addition, the ``index`` attribute is a view that provides both key lookup and slicing on position:
+Note that the methods always return an iterator. Use ``list`` to
+expand to a sequence:
 
->>> skipdict.index(2.0)          # What's the first key that has value 2.0?
+>>> iterator = skipdict.keys()
+>>> list(iterator)
+['bar']
+
+The ``index(value)`` method returns the first key that has exactly the
+required value. If the value is not found then a ``KeyError``
+exception is raised.
+
+>>> skipdict.index(2.0)
 'bar'
->>> skipdict.index[-1]           # What key has the highest value?
-'bar'
->>> skipdict.index[-1:].items()  # What key and value is highest?
-[('bar', 2.0)]
+
+
+Alternatives
+------------
+
+Francesco Romani wrote
+[pyskiplist](https://bitbucket.org/mojaves/pyskiplist) which also
+provides an implementation of the skip list datastructure for CPython
+written in C.
+
+Paul Colomiets wrote
+[sortedsets](https://github.com/tailhook/sortedsets) which is an
+implementation in pure Python. The randomized test cases were adapted
+from this package.
 
 
 License
@@ -46,6 +93,3 @@ License
 Copyright (c) 204 Malthe Borch <mborch@gmail.com>
 
 This software is provided "as-is" under the BSD License.
-
-
-

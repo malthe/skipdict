@@ -1,6 +1,7 @@
+from gc import collect
 from unittest import TestCase
 from operator import itemgetter
-from random import Random, randrange
+from random import Random, randrange, shuffle
 from itertools import combinations
 
 
@@ -8,10 +9,14 @@ class BaseTestCase(TestCase):
     maxlevel = 6
     items = ()
     reverse = False
+    maxDiff = None
 
     def setUp(self):
         items = self.items if not self.reverse else reversed(self.items)
         self.skipdict = self.make(items, self.maxlevel)
+
+    def tearDown(self):
+        collect()
 
     def make(self, *args, **kwargs):
         from skipdict import SkipDict
@@ -23,14 +28,73 @@ class PropertyTestCase(BaseTestCase):
         self.assertEqual(self.skipdict.maxlevel, self.maxlevel)
 
 
-class ConstructorTestCase(BaseTestCase):
+class DictTestCase(BaseTestCase):
     items = {'Xe2W0QxllGdCW251l7U9Dg': 150.0}
 
-    def test_with_dict(self):
-        self.assertEqual(len(self.skipdict), 1)
+    def test_length(self):
+        self.assertEqual(len(self.skipdict), len(self.items))
 
 
-class FuzzyTestCase(BaseTestCase):
+class RandomTestCase(BaseTestCase):
+    items = (("foo", 1.0), )
+
+    def test_random_function(self):
+        called = []
+
+        def random(maxlevel):
+            called.append(1)
+            return maxlevel // 2
+
+        inst = self.make(self.items, self.maxlevel, random)
+        self.assertEqual(list(inst.items()), list(self.items))
+        self.assertEqual(called, [1])
+
+    def test_random_wrong_type(self):
+        def random(maxlevel):
+            return "foo"
+
+        self.assertRaises(
+            TypeError,
+            self.make,
+            self.items,
+            self.maxlevel,
+            random
+        )
+
+    def test_random_out_of_range(self):
+        def random(maxlevel):
+            return maxlevel + 1
+
+        self.assertRaises(
+            ValueError,
+            self.make,
+            self.items,
+            self.maxlevel,
+            random
+        )
+
+
+class IterTestCase(BaseTestCase):
+    quote = "Everything popular is wrong. - Oscar Wilde"
+
+    @property
+    def items(self):
+        return ((char, 1) for char in self.quote)
+
+    def test_length(self):
+        self.assertEqual(len(self.skipdict), 24)
+
+    def test_least_common(self):
+        self.assertTrue(self.quote.count(self.skipdict.keys()[0]), 1)
+
+    def test_second_most_common(self):
+        self.assertEqual(self.skipdict.keys()[-2], 'r')
+
+    def test_most_common(self):
+        self.assertEqual(self.skipdict.keys()[-1], ' ')
+
+
+class FixtureTestCase(BaseTestCase):
     items = (
         ('Xe2W0QxllGdCW251l7U9Dg', 150.0),
         ('3HT/SVSdCwM+4ZjtSqHCew', 476.0),
@@ -86,6 +150,8 @@ class FuzzyTestCase(BaseTestCase):
     keys = list(map(itemgetter(0), items))
     values = list(map(itemgetter(1), items))
 
+
+class ProtocolTestCase(FixtureTestCase):
     def test_contains(self):
         for key in self.keys:
             self.assertTrue(key in self.skipdict)
@@ -100,13 +166,35 @@ class FuzzyTestCase(BaseTestCase):
             "{" + ", ".join("%r: %r" % item for item in self.items) + "}"
         )
 
-    def test_del_item(self):
-        del self.skipdict[self.keys[-1]]
-        self.assertRaises(
-            KeyError,
-            self.skipdict.__getitem__,
-            'zI1yPoXCgPtifROhCST0sA'
-        )
+    def test_change(self):
+        for i, key in enumerate(self.keys):
+            v = 1.0 / (i + 1)
+            self.skipdict.change(key, v)
+            self.assertEqual(self.skipdict[key], self.values[i] + v)
+
+    def test_change_non_existing(self):
+        self.skipdict.change('foo', 5.0)
+        self.assertEqual(self.skipdict['foo'], 5.0)
+
+    def test_del_item_concrete(self):
+        del self.skipdict['mVTvHObgjfzvZLOzl/xo2Q']
+
+    def test_del_item_in_order(self):
+        for key in self.keys:
+            del self.skipdict[key]
+            self.assertRaises(KeyError, self.skipdict.__getitem__, key)
+
+    def test_del_item_in_reverse_order(self):
+        for key in reversed(self.keys):
+            del self.skipdict[key]
+            self.assertRaises(KeyError, self.skipdict.__getitem__, key)
+
+    def test_del_item_in_random_order(self):
+        keys = list(self.keys)
+        shuffle(keys)
+        for key in keys:
+            del self.skipdict[key]
+            self.assertRaises(KeyError, self.skipdict.__getitem__, key)
 
     def test_del_item_missing(self):
         self.assertRaises(
@@ -119,9 +207,28 @@ class FuzzyTestCase(BaseTestCase):
         self.assertEqual(self.skipdict['zI1yPoXCgPtifROhCST0sA'], 62365.0)
 
     def test_set_item_existing(self):
-        self.skipdict[self.keys[-1]] = 62365.0
-        self.assertEqual(self.skipdict[self.keys[-1]], 62365.0)
-        self.assertEqual(len(self.skipdict), len(self.keys))
+        for i in range(len(self.keys)):
+            v = self.values[-i] + 1
+            self.skipdict[self.keys[i]] = v
+            self.assertEqual(self.skipdict[self.keys[i]], v)
+
+    def test_set_item_existing_random(self):
+        for i in (10, 20, 30, 40, 50, 60, 70):
+            rnd = Random(i)
+            for j in range(len(self.keys)):
+                k = self.keys[rnd.randrange(0, len(self.keys), 1)]
+                v = rnd.randrange(self.values[0], self.values[-1], 1)
+                self.skipdict[k] = v
+                self.assertEqual(self.skipdict[k], v)
+
+    def test_set_many_items(self):
+        for i in range(100000):
+            key = "key%d" % i
+            self.skipdict[key] = i * 2
+
+        for i in reversed(range(10000)):
+            key = "key%d" % i
+            self.assertEqual(self.skipdict[key], i * 2)
 
     def test_setdefault(self):
         for key, value in self.items:
@@ -133,42 +240,6 @@ class FuzzyTestCase(BaseTestCase):
 
     def test_iteration(self):
         self.assertEqual(list(self.skipdict), self.keys)
-
-    def test_keys(self):
-        self.assertEqual(self.skipdict.keys(), self.keys)
-
-    def test_values(self):
-        self.assertEqual(self.skipdict.values(), self.values)
-
-    def test_items(self):
-        self.assertEqual(self.skipdict.items(), list(self.items))
-
-    def test_iteritems(self):
-        self.assertEqual(list(self.skipdict.iteritems()), list(self.items))
-
-    def test_iteritems_min(self):
-        self.assertEqual(
-            list(self.skipdict.iteritems(self.values[25])),
-            list(self.items[25:])
-        )
-
-    def test_iteritems_max(self):
-        self.assertEqual(
-            list(self.skipdict.iteritems(None, self.values[25])),
-            list(self.items[:26])
-        )
-
-    def test_iteritems_min_max(self):
-        self.assertEqual(
-            list(self.skipdict.iteritems(self.values[13], self.values[25])),
-            list(self.items[13:26])
-        )
-
-    def test_iteritems_max_min(self):
-        self.assertEqual(
-            list(self.skipdict.iteritems(self.values[25], self.values[13])),
-            list(reversed(self.items[13:26]))
-        )
 
     def test_length(self):
         self.assertEqual(len(self.skipdict), len(self.items))
@@ -184,50 +255,6 @@ class FuzzyTestCase(BaseTestCase):
     def test_index_no_args(self):
         self.assertRaises(TypeError, self.skipdict.index)
 
-    def test_index_repr(self):
-        self.assertEqual(repr(self.skipdict.index), repr(self.keys))
-
-    def test_index_slice(self):
-        self.assertEqual(
-            list(self.skipdict.index[13:25]),
-            self.keys[13:25]
-        )
-
-    def test_index_slice_items(self):
-        self.assertEqual(
-            list(self.skipdict.index[13:25].items()),
-            list(self.items[13:25])
-        )
-
-    def test_index_slice_values(self):
-        self.assertEqual(
-            list(self.skipdict.index[13:25].values()),
-            self.values[13:25]
-        )
-
-    def test_index_slice_min(self):
-        self.assertEqual(
-            list(self.skipdict.index[13:]),
-            self.keys[13:]
-        )
-
-    def test_index_slice_max(self):
-        self.assertEqual(
-            list(self.skipdict.index[:13]),
-            self.keys[:13]
-        )
-
-    def test_index_slice_negative(self):
-        self.assertEqual(
-            list(self.skipdict.index[:-2]),
-            self.keys[:-2]
-        )
-
-    def test_index_subscript(self):
-        length = len(self.items)
-        for i in range(length):
-            self.assertEqual(self.skipdict.index[i], self.keys[i])
-
     def test_random(self):
         # Lets test 7 random insertion orders
         for i in (10, 20, 30, 40, 50, 60, 70):
@@ -239,6 +266,14 @@ class FuzzyTestCase(BaseTestCase):
             set1 = self.make()
             for k, v in to_insert:
                 set1[k] = v
+
+            # Random access
+            keys = list(self.keys)
+            rnd.shuffle(keys)
+            for key in keys:
+                self.assertEqual(set1[key], self.skipdict[key])
+
+            # Create additional sets
             set2 = self.make(to_insert)
             set3 = self.make(set1.items())
             set4 = self.make(set2.items())
@@ -269,60 +304,174 @@ class FuzzyTestCase(BaseTestCase):
                 rnd.shuffle(to_delete)
                 for key, value in to_delete:
                     del cur[key]
+
+                # Test random access
+                keys = list(dict(left))
+                rnd.shuffle(keys)
+                for key in keys:
+                    self.assertNotIn(key, to_delete)
+                    self.assertEqual(cur[key], self.skipdict[key])
+
                 self.assertEqual(list(cur.items()), left)
                 self.assertNotEqual(cur, self.skipdict)
 
             # Let's reinsert keys in random order, and check if it's
             # still ok
-            for cur in cursets:
+            for j, cur in enumerate(cursets):
                 rnd.shuffle(to_delete)
                 for key, value in to_delete:
                     cur[key] = value
+                    self.assertEqual(cur[key], value)
                 self.assertEqual(cur, self.skipdict)
+                self.assertEqual(len(cur), len(self.skipdict))
                 self.assertEqual(list(cur.items()), list(self.items))
-                for i in range(len(self.items)):
-                    key, score = self.items[i]
+
+                keys1 = []
+                keys2 = []
+
+                for i in range(len(self.keys)):
+                    key = self.keys[i]
                     self.assertEqual(cur.index(key), i)
-                    self.assertEqual(cur.index[i], key)
+                    keys1.append(key)
+                    keys2.append(cur.keys()[i])
+
+                self.assertEqual(keys1, keys2)
 
 
-class ReverseFuzzyTest(FuzzyTestCase):
+class ReverseProtocolTestCase(ProtocolTestCase):
     reverse = True
 
-    # def test_slicing(self):
-    #     # Slicing by index should be same as slicing list
-    #     ends = (None, 0, 2, 5, 10, 49, 50, 51, -1, -2, -5, -10, -49, 50, -51)
-    #     steps = (1, 2, 3)
-    #     for start, stop, step in product(ends, ends, steps):
-    #         self.assertEqual(list(set_n.index[start:stop:step].items()),
-    #                          items[start:stop:step])
-    #         self.assertEqual(list(set_r.index[start:stop:step].items()),
-    #                          items[start:stop:step])
-    #     # let's try to delete and reinsert slice
-    #     for start, stop in product(ends, ends):
-    #         slc = set_r.index[start:stop]
-    #         slclist = items[start:stop]
-    #         self.assertEqual(list(slc.items()), slclist)
-    #         # delete a slice from set and list, then compare
-    #         del set_r.index[start:stop]
-    #         tmp = items[:]
-    #         del tmp[start:stop]
-    #         self.assertEqual(list(set_r.items()), tmp)
-    #         # let's recreate set and check
-    #         set_r.update(slc)
-    #         self.assertEqual(list(set_r.items()), items)
 
-    #         # try score slice on reverted set
-    #         if slclist:
-    #             # can do this only if set is not empty
-    #             scorestart = slclist[0][1]
-    #             scorestop = slclist[-1][1] + 1
-    #             slc2 = set_r.by_score[scorestart:scorestop]
-    #             self.assertEqual(list(slc2.items()), slclist)
-    #             del set_r.by_score[scorestart:scorestop]
-    #             self.assertEqual(list(set_r.items()), tmp)
-    #             # and revert this change back again
-    #             set_r.update(slc2)
-    #             self.assertEqual(list(set_r.items()), items)
+class IteratorTestCaseMixin:
+    @property
+    def iterator(self):
+        return self.func()
+
+    @property
+    def func(self):
+        return getattr(self.skipdict, self.method)
+
+    @property
+    def expected(self):
+        return getattr(self, self.method)
+
+    def test_item(self):
+        for i in range(len(self.keys)):
+            self.assertEqual(
+                self.iterator[i],
+                self.expected[i]
+            )
+
+    def test_item_range(self):
+        values = tuple(self.func(2, 3))
+
+        for i in range(len(values)):
+            self.assertEqual(values[i], self.func(2, 3)[i])
+
+    def test_item_min_zero(self):
+        self.assertEqual(
+            self.func(0)[0],
+            self.expected[0]
+        )
+
+    def test_call(self):
+        self.assertRaises(TypeError, self.iterator)
+
+    def test_step(self):
+        self.assertRaises(
+            ValueError,
+            self.iterator.__getitem__,
+            slice(None, None, 2),
+        )
+
+    def test_length(self):
+        self.assertRaises(TypeError, len, self.iterator)
+
+    def test_next(self):
+        iterator = self.func()
+        i = 0
+        while True:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                break
+
+            self.assertEqual(item, self.expected[i])
+            i += 1
+
+    def test_repr(self):
+        self.assertEqual(
+            repr(self.iterator),
+            "<SkipDictIterator "
+            "type=\"%s\" "
+            "forward=true "
+            "min=%r "
+            "max=%r "
+            "at 0x%x>" % (
+                self.method,
+                self.values[0],
+                self.values[-1],
+                id(self.skipdict),
+            )
+        )
+
+    def test_min(self):
+        self.assertEqual(
+            list(self.func(self.values[25])),
+            list(self.expected[25:])
+        )
+
+    def test_max(self):
+        self.assertEqual(
+            list(self.func(None, self.values[25])),
+            list(self.expected[:26])
+        )
+
+    def test_min_max(self):
+        self.assertEqual(
+            list(self.func(self.values[13], self.values[25])),
+            list(self.expected[13:26])
+        )
+
+    def test_max_min(self):
+        self.assertEqual(
+            list(self.func(self.values[25], self.values[13])),
+            list(reversed(self.expected[13:26]))
+        )
+
+    def decorate(f):
+        def wrapper(self):
+            s = f(self)
+            self.assertEqual(
+                list(self.expected[s]),
+                list(self.iterator[s])
+            )
+        return wrapper
+
+    @decorate
+    def test_slice_min(self):
+        return slice(13, None, 1)
+
+    @decorate
+    def test_slice_max(self):
+        return slice(None, 13, 1)
+
+    @decorate
+    def test_slice_min_max(self):
+        return slice(13, 25, 1)
+
+    @decorate
+    def test_slice_max_negative(self):
+        return slice(None, -2, 1)
 
 
+class IterKeysTestCase(IteratorTestCaseMixin, FixtureTestCase):
+    method = "keys"
+
+
+class IterValuesTestCase(IteratorTestCaseMixin, FixtureTestCase):
+    method = "values"
+
+
+class IterItemsTestCase(IteratorTestCaseMixin, FixtureTestCase):
+    method = "items"

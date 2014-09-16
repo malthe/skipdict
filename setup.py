@@ -37,6 +37,7 @@ setup(name="skipdict",
           "Programming Language :: Python :: 3.4",
           'Topic :: Software Development :: Libraries :: Python Modules',
       ],
+      url="https://github.com/malthe/skipdict",
       zip_safe=False,
       test_suite="tests",
       py_modules=['skipdict'])
