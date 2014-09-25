@@ -76,15 +76,15 @@ exception is raised.
 Alternatives
 ------------
 
-Francesco Romani wrote
-[pyskiplist](https://bitbucket.org/mojaves/pyskiplist) which also
-provides an implementation of the skip list datastructure for CPython
-written in C.
+Francesco Romani wrote `pyskiplist
+<https://bitbucket.org/mojaves/pyskiplist>`_ which also provides an
+implementation of the skip list datastructure for CPython written
+in C.
 
-Paul Colomiets wrote
-[sortedsets](https://github.com/tailhook/sortedsets) which is an
-implementation in pure Python. The randomized test cases were adapted
-from this package.
+Paul Colomiets wrote `sortedsets
+<https://github.com/tailhook/sortedsets>`_ which is an implementation
+in pure Python. The randomized test cases were adapted from this
+package.
 
 
 License
