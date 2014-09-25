@@ -19,7 +19,7 @@ ext_modules = [
 
 
 setup(name="skipdict",
-      version="1.0-dev",
+      version="1.0",
       description="Python dictionary object permanently sorted by value.",
       long_description="\n\n".join((read('README.rst'), read('CHANGES.rst'))),
       license="BSD",
